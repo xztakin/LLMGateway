@@ -25,10 +25,36 @@ ollama pull qwen3:14b          # each model an app uses, one time
 - **Other commands:** `scripts/service.sh status`, `scripts/service.sh uninstall`. Downloaded models stay in `~/.ollama`.
 - **Stop from the menu:** Ollama stays stopped until you start it again or log in again. Every app that uses it fails its AI calls in the meantime.
 
+### Reaching it from another machine (the remote TradeFlow host)
+
+Other machines reach Ollama over Tailscale only. It is never on the LAN or the internet (SPEC.md §7).
+
+1. **This Mac, once:**
+   - Install Tailscale with `brew install --cask tailscale-app`. It asks for your password.
+   - Open Tailscale from Applications, allow its system extension, and log in.
+   - Then run `scripts/tailnet.sh share`. It prints the URL the remote host should use, `http://<this-mac>.<tailnet>.ts.net:11434`.
+   - Tailscale keeps the setting across reboots.
+2. **The remote host:**
+   - Install Tailscale and join the same tailnet with `tailscale up --advertise-tags=tag:tradeflow`.
+   - In TradeFlow's `.env`, set `TRADEFLOW_OLLAMA_URL` to the printed URL. If the Docker containers can't resolve `*.ts.net` names, use the 100.x IP instead.
+   - Check it from the host with `curl $TRADEFLOW_OLLAMA_URL/api/version`.
+3. **Access rule:** Ollama has no authentication, so limit who can reach the port. In the Tailscale admin console under Access controls, tag this Mac `tag:llm` and add a rule like this:
+
+   ```json
+   "tagOwners": { "tag:llm": ["autogroup:admin"], "tag:tradeflow": ["autogroup:admin"] },
+   "grants": [ { "src": ["tag:tradeflow"], "dst": ["tag:llm"], "ip": ["tcp:11434"] } ]
+   ```
+
+   Add LeadScout's machine to `src` when it moves off this Mac. If your policy still has the default allow-all rule, remove it, or every tailnet device can reach the model.
+4. **Keep this Mac awake:** if it sleeps, the sentinel fails closed and blocks entries. Keep it plugged in. System sleep is already off (`pmset -g`), but closing the lid still sleeps it.
+
+`scripts/tailnet.sh status` shows the tailnet address and whether Ollama answers there. `scripts/tailnet.sh unshare` takes it off the tailnet. Once the gateway exists, share the gateway's port instead. It adds per-client keys.
+
 ### Files
 
 | Path | What it is |
 | --- | --- |
+| `scripts/tailnet.sh` | Serves Ollama on the Tailscale network for remote apps |
 | `scripts/service.sh` | Installs the two launchd agents: `local.llmgateway.ollama` and `local.llmgateway.tray` |
 | `ollama/serve.sh` | What launchd runs: loads `ollama.env`, then `exec ollama serve` |
 | `ollama/ollama.env` | Ollama settings |
