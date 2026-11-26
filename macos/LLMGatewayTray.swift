@@ -1,8 +1,9 @@
 // LLMGateway menu bar icon: shows whether the shared Ollama server is up and which model is loaded,
 // and starts, stops or restarts it. Every app that uses the local model (LeadScout, TradeFlow's
-// Sentinel, ...) talks to this one server.
+// Sentinel, ...) talks to this one server. "Open Chat…" opens a window for chatting with a model.
 // Built and installed by scripts/service.sh.
 import AppKit
+import SwiftUI
 
 let env = ProcessInfo.processInfo.environment
 let ollamaURL = env["LLMGATEWAY_OLLAMA_URL"] ?? "http://127.0.0.1:11434"
@@ -86,6 +87,7 @@ final class TrayController: NSObject, NSMenuDelegate {
     let menu = NSMenu()
     var status = Status()
     var timer: Timer?
+    let chatWindow = ChatWindowController()
 
     override init() {
         super.init()
@@ -117,6 +119,8 @@ final class TrayController: NSObject, NSMenuDelegate {
                 header("Loaded: \(model.name) (\(gigabytes(model.bytes)))\(until)")
             }
         }
+        menu.addItem(.separator())
+        add("Open Chat…", #selector(openChat), "")
         menu.addItem(.separator())
 
         if status.reachable {
@@ -233,10 +237,288 @@ final class TrayController: NSObject, NSMenuDelegate {
                                 configuration: NSWorkspace.OpenConfiguration())
     }
 
+    @objc func openChat() { chatWindow.show() }
+
     @objc func quit() { NSApp.terminate(nil) }
+}
+
+// MARK: - Chat window
+
+struct ChatMessage: Identifiable {
+    let id = UUID()
+    var role: String // "user" or "assistant"
+    var content: String
+    var thinking = ""
+}
+
+/// The conversation, streamed from Ollama's /api/chat. Kept while the window is closed; "New Chat" clears it.
+final class ChatModel: ObservableObject {
+    @Published var messages: [ChatMessage] = []
+    @Published var input = ""
+    @Published var models: [String] = []
+    @Published var thinkingModels: Set<String> = []
+    @Published var model = UserDefaults.standard.string(forKey: "chatModel") ?? "" {
+        didSet { UserDefaults.standard.set(model, forKey: "chatModel") }
+    }
+    @Published var think = false
+    @Published var busy = false
+    @Published var error: String?
+    private var task: Task<Void, Never>?
+
+    var canThink: Bool { thinkingModels.contains(model) }
+
+    /// Fetches the installed models, and which of them can think (e.g. qwen3), off the main thread.
+    func loadModels() {
+        DispatchQueue.global().async {
+            let names = ((ollama("/api/tags")?["models"] as? [[String: Any]]) ?? []).compactMap { $0["name"] as? String }.sorted()
+            let thinking = Set(names.filter { name in
+                ((ollama("/api/show", body: ["model": name])?["capabilities"] as? [String]) ?? []).contains("thinking")
+            })
+            let loaded = ((ollama("/api/ps")?["models"] as? [[String: Any]]) ?? []).compactMap { $0["name"] as? String }
+            DispatchQueue.main.async {
+                self.models = names
+                self.thinkingModels = thinking
+                if !names.contains(self.model) {
+                    // Prefer a model already in memory, so the first reply doesn't wait for a load.
+                    self.model = loaded.first(where: names.contains) ?? names.first ?? ""
+                }
+                if names.isEmpty { self.error = "No models found. Is Ollama running? (ollama pull qwen3:14b)" }
+                else if self.error?.hasPrefix("No models") == true { self.error = nil }
+            }
+        }
+    }
+
+    @MainActor func send() {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !busy, !model.isEmpty else { return }
+        input = ""
+        error = nil
+        messages.append(ChatMessage(role: "user", content: text))
+        let history = messages.map { ["role": $0.role, "content": $0.content] }
+        messages.append(ChatMessage(role: "assistant", content: ""))
+        busy = true
+        task = Task { @MainActor in
+            await self.stream(history: history)
+            self.busy = false
+        }
+    }
+
+    @MainActor func stop() { task?.cancel() }
+
+    @MainActor func clear() {
+        task?.cancel()
+        messages = []
+        error = nil
+    }
+
+    @MainActor private func stream(history: [[String: String]]) async {
+        let index = messages.count - 1
+        var body: [String: Any] = ["model": model, "messages": history, "stream": true]
+        if canThink { body["think"] = think } // Sending "think" to a model that can't think is an error.
+        do {
+            var request = URLRequest(url: URL(string: ollamaURL + "/api/chat")!, timeoutInterval: 600)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            let ok = (response as? HTTPURLResponse)?.statusCode == 200
+            var failure = ""
+            // Ollama streams one JSON object per line.
+            for try await line in bytes.lines {
+                guard let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else {
+                    failure += line
+                    continue
+                }
+                if let message = object["error"] as? String { throw ChatError(message: message) }
+                if let message = object["message"] as? [String: Any], index < messages.count {
+                    messages[index].content += message["content"] as? String ?? ""
+                    messages[index].thinking += message["thinking"] as? String ?? ""
+                }
+            }
+            if !ok { throw ChatError(message: failure.isEmpty ? "Ollama returned an error." : failure) }
+        } catch is CancellationError {
+        } catch let failure as URLError where failure.code == .cancelled {
+        } catch let failure as URLError where failure.code == .cannotConnectToHost {
+            error = "Can't reach Ollama at \(ollamaURL). Start it from the menu bar icon."
+        } catch {
+            self.error = (error as? ChatError)?.message ?? error.localizedDescription
+        }
+        // Drop a reply that never got any text, so it isn't sent back as history.
+        if index < messages.count, messages[index].content.isEmpty, messages[index].thinking.isEmpty {
+            messages.remove(at: index)
+        }
+    }
+}
+
+struct ChatError: Error { let message: String }
+
+struct MessageRow: View {
+    let message: ChatMessage
+    let streaming: Bool
+
+    var body: some View {
+        if message.role == "user" {
+            HStack {
+                Spacer(minLength: 60)
+                Text(message.content)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color.accentColor.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                if !message.thinking.isEmpty {
+                    DisclosureGroup(streaming && message.content.isEmpty ? "Thinking…" : "Thought process") {
+                        Text(message.thinking.trimmingCharacters(in: .whitespacesAndNewlines))
+                            .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .font(.callout).foregroundStyle(.secondary)
+                }
+                if message.content.isEmpty && streaming {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text(markdown(message.content.trimmingCharacters(in: .whitespacesAndNewlines)))
+                        .textSelection(.enabled)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    func markdown(_ text: String) -> AttributedString {
+        (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(text)
+    }
+}
+
+struct ChatView: View {
+    @ObservedObject var chat: ChatModel
+    @FocusState private var inputFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Picker("Model", selection: $chat.model) {
+                    ForEach(chat.models, id: \.self) { Text($0).tag($0) }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 220)
+                Toggle("Think", isOn: $chat.think)
+                    .disabled(!chat.canThink)
+                    .help(chat.canThink ? "Let the model reason before answering (slower)" : "This model can't think")
+                Spacer()
+                Button("New Chat") { chat.clear(); inputFocused = true }
+                    .keyboardShortcut("n", modifiers: .command)
+                    .disabled(chat.messages.isEmpty)
+            }
+            .padding(10)
+            Divider()
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(chat.messages) { message in
+                            MessageRow(message: message, streaming: chat.busy && message.id == chat.messages.last?.id)
+                                .id(message.id)
+                        }
+                    }
+                    .padding(14)
+                }
+                .onChange(of: chat.messages.last?.content) { _ in
+                    if let id = chat.messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                }
+                .overlay {
+                    if chat.messages.isEmpty {
+                        Text("Chat with \(chat.model.isEmpty ? "a local model" : chat.model)")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            if let error = chat.error {
+                Text(error)
+                    .font(.callout).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.bottom, 6)
+            }
+            Divider()
+
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Message (Return to send, Option-Return for a new line)", text: $chat.input, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...8)
+                    .focused($inputFocused)
+                    .onSubmit { chat.send() }
+                if chat.busy {
+                    Button("Stop") { chat.stop() }.keyboardShortcut(".", modifiers: .command)
+                } else {
+                    Button("Send") { chat.send() }
+                        .disabled(chat.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || chat.model.isEmpty)
+                }
+            }
+            .padding(10)
+        }
+        .frame(minWidth: 420, minHeight: 360)
+        .onAppear { inputFocused = true }
+    }
+}
+
+/// The chat window. While it's open the app shows in the Dock and Cmd-Tab like a normal app; when it
+/// closes the app goes back to living only in the menu bar.
+final class ChatWindowController: NSObject, NSWindowDelegate {
+    let chat = ChatModel()
+    var window: NSWindow?
+
+    func show() {
+        if window == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 680),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                  backing: .buffered, defer: false)
+            window.title = "LLMGateway Chat"
+            window.isReleasedWhenClosed = false
+            window.contentViewController = NSHostingController(rootView: ChatView(chat: chat))
+            window.center()
+            window.setFrameAutosaveName("LLMGatewayChat")
+            window.delegate = self
+            self.window = window
+        }
+        chat.loadModels()
+        NSApp.setActivationPolicy(.regular)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
+}
+
+/// Without a main menu, Cmd-C / Cmd-V / Cmd-A / Cmd-W do nothing in the chat window.
+func installMainMenu() {
+    let main = NSMenu()
+    let appItem = NSMenuItem()
+    let appMenu = NSMenu()
+    appMenu.addItem(withTitle: "Hide LLMGateway", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+    appMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+    appItem.submenu = appMenu
+    main.addItem(appItem)
+
+    let editItem = NSMenuItem()
+    let edit = NSMenu(title: "Edit")
+    edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+    edit.addItem(.separator())
+    edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    editItem.submenu = edit
+    main.addItem(editItem)
+    NSApp.mainMenu = main
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory) // menu bar only, no Dock icon
+installMainMenu()
 let controller = TrayController()
 app.run()

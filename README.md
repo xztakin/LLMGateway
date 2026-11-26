@@ -20,6 +20,7 @@ ollama pull qwen3:14b          # each model an app uses, one time
   - The menu shows the loaded model and when it unloads, and lists the installed models.
   - It can unload a model to free memory, and start, stop or restart Ollama.
   - It also opens the log and the settings file.
+  - **Open Chat…** opens a chat window, so you can use the local model like an app. You pick the model, and Think turns reasoning on for qwen3. Replies stream in. While the window is open, the app shows in the Dock and in Cmd-Tab. The chat uses one of Ollama's two parallel slots.
 - **Settings:** `ollama/ollama.env` holds the listen address, keep-alive time and parallel slots. After editing it, choose **Restart Ollama** from the menu, or run `scripts/service.sh restart`.
 - **Log:** `logs/ollama.log`. It moves to `ollama.log.1` once it passes 50 MB, checked each time Ollama starts.
 - **Other commands:** `scripts/service.sh status`, `scripts/service.sh uninstall`. Downloaded models stay in `~/.ollama`.
